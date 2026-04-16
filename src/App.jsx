@@ -7,6 +7,7 @@ import Landing from './pages/Landing';
 import Auth from './pages/Auth';
 import Chat from './pages/Chat';
 import ComingSoon from './pages/ComingSoon';
+import Resources from './pages/Resources';
 
 function App() {
   return (
@@ -27,7 +28,7 @@ function App() {
             
             <Route path="resources" element={
               <ProtectedRoute>
-                <ComingSoon />
+                <Resources />
               </ProtectedRoute>
             } />
             

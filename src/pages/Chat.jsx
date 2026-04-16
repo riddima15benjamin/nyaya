@@ -4,6 +4,83 @@ import { supabase } from '../lib/supabase';
 import { Send, Menu, MessageSquare, Plus } from 'lucide-react';
 import { useLocation, useNavigate } from 'react-router-dom';
 
+const SYSTEM_PROMPT = (language) => `You are Nyaya, a legal-aid assistant for people in India.
+
+Your job:
+- Give plain-language, practical legal information for India.
+- Be calm, empathetic, direct, and useful.
+- Respond entirely in ${language}.
+- If the user writes in another language but has chosen ${language}, still answer in ${language}.
+
+Rules:
+- Focus only on Indian legal rights, process, documents, authorities, remedies, and next steps.
+- Do not invent laws, sections, deadlines, offices, or procedures. If unsure, say so clearly.
+- Do not draft binding legal documents, contracts, wills, affidavits, or anything that could be mistaken for formal legal representation.
+- If the issue is non-legal, politely say you can only help with legal matters in India.
+- If there is immediate danger, violence, sexual assault, child abuse, trafficking, or urgent medical risk, first advise the user to contact emergency help immediately.
+- Mention that you are an AI legal information assistant, not a lawyer, but do this briefly and naturally instead of repeating it in every paragraph.
+
+Response style:
+- Prefer short, practical answers.
+- Ask at most 2 brief follow-up questions only if needed to give better guidance.
+- Use this structure when helpful:
+  1. Situation
+  2. What the law generally says
+  3. What you can do next
+  4. Where to go for help
+- Include specific Indian authorities or forums when relevant, such as Police, Women Helpline, DLSA, labour office, consumer commission, cybercrime portal, or court type.
+- If the user asks for steps, make them concrete and sequential.
+
+Emergency contacts to mention when relevant:
+- Police: 100
+- Emergency Response Support System: 112
+- Women Helpline: 1091
+- Cybercrime portal: cybercrime.gov.in
+
+Do not say you cannot help unless the request is outside legal information or too uncertain to answer safely.`;
+
+const extractGeminiText = (result) => {
+  const candidate = result?.candidates?.[0];
+  const parts = candidate?.content?.parts || [];
+  const text = parts
+    .map((part) => part?.text)
+    .filter(Boolean)
+    .join('\n')
+    .trim();
+
+  if (text) return text;
+  if (result?.promptFeedback?.blockReason) {
+    return `I couldn't answer that request because it was blocked by the model safety system (${result.promptFeedback.blockReason}). Please rephrase your question in a simple legal-information format.`;
+  }
+
+  return null;
+};
+
+const formatGeminiError = (status, errorText) => {
+  let parsedMessage = '';
+
+  try {
+    const parsed = JSON.parse(errorText);
+    parsedMessage = parsed?.error?.message || '';
+  } catch {
+    parsedMessage = errorText || '';
+  }
+
+  if (status === 429) {
+    return 'Nyaya could not generate a reply because the Gemini API quota for this key has been exceeded. Add billing or use a different Gemini API key, then try again.';
+  }
+
+  if (status === 401 || status === 403) {
+    return 'Nyaya could not access Gemini with the current API key. Please check that VITE_GEMINI_API_KEY is valid and enabled for the Generative Language API.';
+  }
+
+  if (!parsedMessage) {
+    return `Gemini request failed with status ${status}.`;
+  }
+
+  return `Gemini request failed: ${parsedMessage}`;
+};
+
 export default function Chat() {
   const { user } = useAuth();
   const location = useLocation();
@@ -15,9 +92,10 @@ export default function Chat() {
   const [input, setInput] = useState('');
   
   const [loading, setLoading] = useState(true);
-  const [language, setLanguage] = useState(localStorage.getItem('nyaya_language') || '');
+  const [language, setLanguage] = useState(localStorage.getItem('nyaya_language') || 'English');
   const [showPicker, setShowPicker] = useState(!localStorage.getItem('nyaya_language'));
   const [confirmationMsg, setConfirmationMsg] = useState(null);
+  const [chatNotice, setChatNotice] = useState(null);
 
   const languageOptions = ['English', 'हिन्दी', 'தமிழ்', 'తెలుగు', 'ಕನ್ನಡ', 'മലയാളം', 'मराठी', 'বাংলা', 'ગુજરાતી', 'ਪੰਜਾਬੀ'];
   const languageConfirmations = {
@@ -48,6 +126,21 @@ export default function Chat() {
   
   const messagesEndRef = useRef(null);
 
+  const getSelectedLanguage = () => localStorage.getItem('nyaya_language') || 'English';
+  const isTemporarySession = (sessionId) => typeof sessionId === 'string' && sessionId.startsWith('local-');
+  const createLocalSession = () => {
+    const localId = `local-${Date.now()}`;
+    setActiveSessionId(localId);
+    setConfirmationMsg(null);
+    setShowPicker(!localStorage.getItem('nyaya_language'));
+    setSessions((prev) => [{
+      id: localId,
+      created_at: new Date().toISOString(),
+      title: 'New Chat',
+    }, ...prev]);
+    return localId;
+  };
+
   const scrollToBottom = () => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   };
@@ -58,6 +151,11 @@ export default function Chat() {
 
   // Load initial data
   useEffect(() => {
+    if (!user) {
+      setLoading(false);
+      return;
+    }
+
     const initializeChat = async () => {
       setLoading(true);
       await fetchSessions(true);
@@ -65,7 +163,7 @@ export default function Chat() {
     };
     
     initializeChat();
-  }, []);
+  }, [user]);
 
   // Handle "New Case" link clicks (from location state change)
   useEffect(() => {
@@ -91,6 +189,10 @@ export default function Chat() {
       
     if (sessionError) {
       console.error("Error fetching sessions:", sessionError);
+      setChatNotice('Chat history could not be loaded from Supabase. You can still chat in this session, but it may not be saved.');
+      if (initialLoad && !activeSessionId) {
+        createLocalSession();
+      }
       return;
     }
 
@@ -122,6 +224,7 @@ export default function Chat() {
   const createNewSession = async () => {
     if (!user) return;
     setMessages([]);
+    setChatNotice(null);
     const { data, error } = await supabase
       .from('chat_sessions')
       .insert({ user_id: user.id })
@@ -130,7 +233,8 @@ export default function Chat() {
       
     if (error) {
       console.error("Error creating session:", error);
-      return;
+      setChatNotice('Supabase could not create a chat session. Messages will stay in this tab only until storage is fixed.');
+      return createLocalSession();
     }
     
     setActiveSessionId(data.id);
@@ -142,6 +246,8 @@ export default function Chat() {
       created_at: data.created_at,
       title: 'New Chat'
     }, ...prev]);
+
+    return data.id;
   };
 
   const loadSession = async (sessionId) => {
@@ -151,6 +257,12 @@ export default function Chat() {
 
   const fetchMessages = async (sessionId) => {
     if (!sessionId) return;
+    if (isTemporarySession(sessionId)) {
+      setActiveSessionId(sessionId);
+      setConfirmationMsg(null);
+      setShowPicker(!localStorage.getItem('nyaya_language'));
+      return;
+    }
     
     const { data, error } = await supabase
       .from('chat_messages')
@@ -171,26 +283,30 @@ export default function Chat() {
 
   const handleSend = async (e) => {
     e.preventDefault();
-    if (!input.trim() || !activeSessionId) return;
+    if (!input.trim()) return;
 
     const userText = input.trim();
+    const sessionId = activeSessionId || await createNewSession();
+    if (!sessionId) return;
+
     setInput('');
     
     // Add to local UI instantly
-    const newMsg = { id: Date.now().toString(), session_id: activeSessionId, role: 'user', content: userText };
+    const newMsg = { id: Date.now().toString(), session_id: sessionId, role: 'user', content: userText };
     const updatedMessages = [...messages, newMsg];
     setMessages(updatedMessages);
     setTyping(true);
 
     // 1. Insert user message to Supabase
-    const { error: insertError } = await supabase
-      .from('chat_messages')
-      .insert({ session_id: activeSessionId, role: 'user', content: userText });
+    if (!isTemporarySession(sessionId)) {
+      const { error: insertError } = await supabase
+        .from('chat_messages')
+        .insert({ session_id: sessionId, role: 'user', content: userText });
       
-    if (insertError) {
-      console.error("Error saving user message:", insertError);
-      setTyping(false);
-      return;
+      if (insertError) {
+        console.error("Error saving user message:", insertError);
+        setChatNotice('Your message was sent in this tab, but saving to Supabase failed. Chat history may not persist.');
+      }
     }
     
     // If it was a 'New Chat', we should refresh the sessions list to update the title
@@ -200,41 +316,31 @@ export default function Chat() {
 
     // 2. Format request for Gemini API
     try {
-      // Get last 10 messages for context
-      const historyContext = updatedMessages.slice(-10)
-        .map(m => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
-        .join('\n');
-        
-      const promptText = `Chat History:\n${historyContext}\nUser: ${userText}\nAssistant:`;
-      
-      const language = localStorage.getItem('nyaya_language') || 'English';
-      const systemPromptText = `You are Nyaya, a compassionate and highly knowledgeable legal aid assistant helping underprivileged people in India understand their legal rights. You provide free, accurate, and easy-to-understand legal preliminary guidance.
-
-CRITICAL INSTRUCTIONS:
-1. Language: Always respond entirely in ${language}. Do not mix languages unless providing specific legal terms that are best understood in English alongside the translation.
-2. Tone: Be warm, empathetic, and strictly professional. Do not sound like a generic AI machine. Speak simply and avoid confusing legal jargon when possible.
-3. Structure your response clearly using markdown:
-   - "The Situation": A brief empathetic summary of their issue.
-   - "The Law (Simple Terms)": Explain the relevant Indian laws (e.g., IPC, BNS, BNSS, POSH Act, etc.) very simply.
-   - "Your Legal Rights": Bullet points of exactly what rights they have in this scenario.
-   - "Next Actionable Steps": A numbered clear action plan of what they should actually DO right now (e.g., "Gather these documents," "Visit this specific local office," etc.).
-4. Guardrails & Safety: 
-   - NEVER draft binding legal documents (contracts, wills).
-   - If a situation involves immediate physical danger or domestic violence, you MUST immediately advise them to contact the Police (100) or Women's Helpline (1091).
-   - Constantly state that you are an AI assistant and they should consult a registered lawyer or District Legal Services Authority (DLSA) for formal representation.
-5. Focus: Reject non-legal topics politely.`;
+      const selectedLanguage = getSelectedLanguage();
+      const conversation = updatedMessages.slice(-12).map((message) => ({
+        role: message.role === 'assistant' ? 'model' : 'user',
+        parts: [{ text: message.content }],
+      }));
 
       const payload = {
-        contents: [
-          { role: "user", parts: [{ text: promptText }] }
-        ],
+        contents: conversation,
         systemInstruction: {
-          parts: [{ text: systemPromptText }]
-        }
+          parts: [{ text: SYSTEM_PROMPT(selectedLanguage) }]
+        },
+        generationConfig: {
+          temperature: 0.4,
+          topP: 0.9,
+          maxOutputTokens: 900,
+        },
       };
 
       const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
-      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${apiKey}`;
+      if (!apiKey) {
+        throw new Error('Gemini API key is missing. Set VITE_GEMINI_API_KEY in your .env file.');
+      }
+
+      const modelName = import.meta.env.VITE_GEMINI_MODEL || 'gemini-2.0-flash';
+      const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${apiKey}`;
 
       const response = await fetch(endpoint, {
         method: 'POST',
@@ -242,25 +348,40 @@ CRITICAL INSTRUCTIONS:
         body: JSON.stringify(payload)
       });
 
-      const result = await response.json();
-      
-      let aiText = "I'm sorry, I'm having trouble connecting right now. Please try again later.";
-      if (result.candidates && result.candidates[0]?.content?.parts[0]?.text) {
-        aiText = result.candidates[0].content.parts[0].text;
+      if (!response.ok) {
+        const errorText = await response.text();
+        throw new Error(formatGeminiError(response.status, errorText));
       }
 
+      const result = await response.json();
+      
+      let aiText = extractGeminiText(result) || "I'm sorry, I couldn't generate a clear legal guidance response just now. Please try asking your issue in one or two short sentences.";
+
       // Add AI response to UI
-      const aiResponseMsg = { id: Date.now().toString() + 'ai', session_id: activeSessionId, role: 'assistant', content: aiText };
+      const aiResponseMsg = { id: Date.now().toString() + 'ai', session_id: sessionId, role: 'assistant', content: aiText };
       setMessages(prev => [...prev, aiResponseMsg]);
       
       // 3. Insert AI response to Supabase
-      await supabase
-        .from('chat_messages')
-        .insert({ session_id: activeSessionId, role: 'assistant', content: aiText });
+      if (!isTemporarySession(sessionId)) {
+        const { error: assistantSaveError } = await supabase
+          .from('chat_messages')
+          .insert({ session_id: sessionId, role: 'assistant', content: aiText });
+
+        if (assistantSaveError) {
+          console.error("Error saving assistant message:", assistantSaveError);
+          setChatNotice('The reply was generated, but saving chat history to Supabase failed.');
+        }
+      }
         
     } catch (err) {
       console.error("Gemini API Error:", err);
-      // Optional: Add an error message blurb
+      const errorMessage = {
+        id: Date.now().toString() + 'err',
+        session_id: sessionId,
+        role: 'assistant',
+        content: `I ran into a problem while generating a response. ${err.message || 'Please try again.'}`
+      };
+      setMessages(prev => [...prev, errorMessage]);
     } finally {
       setTyping(false);
     }
@@ -391,6 +512,22 @@ CRITICAL INSTRUCTIONS:
 
         {/* Messages List */}
         <div style={{ flex: 1, overflowY: 'auto', padding: '2rem', display: 'flex', flexDirection: 'column', gap: '1.5rem' }}>
+          {chatNotice && (
+            <div style={{
+              alignSelf: 'center',
+              maxWidth: '90%',
+              backgroundColor: '#fff4d6',
+              border: '1px solid #e9c46a',
+              color: '#6b4f00',
+              padding: '0.85rem 1rem',
+              borderRadius: '12px',
+              fontSize: '0.92rem',
+              lineHeight: 1.5
+            }}>
+              {chatNotice}
+            </div>
+          )}
+
           {messages.length === 0 && (
             <div style={{
               alignSelf: 'flex-start',
@@ -549,26 +686,25 @@ CRITICAL INSTRUCTIONS:
               type="text"
               value={input}
               onChange={(e) => setInput(e.target.value)}
-              placeholder={showPicker ? "Please select a language first..." : "Describe your legal issue here..."}
-              disabled={showPicker}
+              placeholder="Describe your legal issue here..."
               style={{
                 flex: 1,
                 padding: '1rem 1.5rem',
                 borderRadius: '50px',
                 border: '1px solid rgba(0,0,0,0.1)',
-                backgroundColor: showPicker ? '#eee' : 'var(--color-bg)',
+                backgroundColor: 'var(--color-bg)',
                 fontSize: '1.05rem',
                 outline: 'none',
                 fontFamily: 'var(--font-body)',
                 transition: 'border-color 0.2s',
-                opacity: showPicker ? 0.6 : 1
+                opacity: 1
               }}
               onFocus={(e) => e.target.style.borderColor = 'var(--color-accent)'}
               onBlur={(e) => e.target.style.borderColor = 'rgba(0,0,0,0.1)'}
             />
             <button 
               type="submit" 
-              disabled={!input.trim() || typing || showPicker}
+              disabled={!input.trim() || typing}
               style={{
                 backgroundColor: 'var(--color-primary)',
                 color: 'white',
@@ -579,11 +715,11 @@ CRITICAL INSTRUCTIONS:
                 display: 'flex',
                 alignItems: 'center',
                 justifyContent: 'center',
-                cursor: input.trim() && !typing && !showPicker ? 'pointer' : 'default',
-                opacity: input.trim() && !typing && !showPicker ? 1 : 0.6,
+                cursor: input.trim() && !typing ? 'pointer' : 'default',
+                opacity: input.trim() && !typing ? 1 : 0.6,
                 transition: 'all 0.2s'
               }}
-              onMouseEnter={e => { if(input.trim() && !typing && !showPicker) e.currentTarget.style.transform = 'scale(1.05)' }}
+              onMouseEnter={e => { if(input.trim() && !typing) e.currentTarget.style.transform = 'scale(1.05)' }}
               onMouseLeave={e => { e.currentTarget.style.transform = 'scale(1)' }}
             >
               <Send size={24} style={{ marginLeft: '4px' }} /> {/* Optically center the paper plane */}

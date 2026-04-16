@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { supabase } from '../lib/supabase';
+import { supabase, supabaseConfig } from '../lib/supabase';
 import { useNavigate } from 'react-router-dom';
 import Logo from '../components/Logo';
 
@@ -14,6 +14,14 @@ export default function Auth() {
   const [error, setError] = useState(null);
   
   const navigate = useNavigate();
+
+  const formatAuthError = (err) => {
+    if (err instanceof TypeError && /fetch/i.test(err.message)) {
+      return `Could not reach Supabase Auth at ${supabaseConfig.url}. This usually means the project URL/key is wrong, the Supabase project is paused, or the network is blocking the request.`;
+    }
+
+    return err.message || 'Authentication failed.';
+  };
 
   const handleAuth = async (e) => {
     e.preventDefault();
@@ -46,7 +54,7 @@ export default function Auth() {
         navigate('/chat');
       }
     } catch (err) {
-      setError(err.message);
+      setError(formatAuthError(err));
     } finally {
       setLoading(false);
     }
